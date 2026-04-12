@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+
+# Downloaded game files (re-fetched from API on demand)
+environment_files/
+
+# Replay frames and GIFs (generated output)
+replays/
+
+# Zone identifiers (Windows WSL artefacts)
+*.Zone.Identifier
+*:Zone.Identifier
