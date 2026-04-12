@@ -43,6 +43,7 @@ from curiosity_explorer import CuriosityExplorer, MEANING_DIM, compute_delta
 from relational_transformer import RelationalTransformer, InteractionMemory, InteractionRecord, EFFECT_DIM
 from goal_planner import GoalInferenceModule, Planner, GoalHypothesis
 from knowledge_space import KnowledgeSpace
+from react_planner import ReActPlanner
 
 
 log = logging.getLogger(__name__)
@@ -134,6 +135,7 @@ class ObjectCentricAgent:
         self.goal_inf = GoalInferenceModule()
         self.planner = Planner()
         self.knowledge = KnowledgeSpace()
+        self.react = ReActPlanner()   # reads ANTHROPIC_API_KEY from env
 
         # State
         self._prev_blobs: List[ObjectBlob] = []
@@ -163,6 +165,7 @@ class ObjectCentricAgent:
         self.space = EmbeddingSpace(slot_dim=SLOT_DIM, meaning_dim=MEANING_DIM)
         self.memory.clear()
         self.goal_inf = GoalInferenceModule()
+        self.react.reset()
 
         # Extract initial objects
         blobs = self.extractor(grid)
@@ -246,13 +249,31 @@ class ObjectCentricAgent:
                 with torch.no_grad():
                     world_state = self.rt(mat, oids, mem_tensor)
                 self.goal_inf.update(self.space, world_state, game_state)
-                goal = self.goal_inf.best_goal()
+
+                # ReAct: query LLM when periodic or stuck
+                if self.react.should_call(
+                    self._action_count, self._planner_stuck_count, self.stuck_threshold
+                ):
+                    react_goal = self.react.reason(
+                        self.space, self._action_count, self._level
+                    )
+                    if react_goal is not None:
+                        goal = react_goal
+                        source_tag = "react"
+                    else:
+                        goal = self.goal_inf.best_goal()
+                        source_tag = "heuristic"
+                else:
+                    goal = self.goal_inf.best_goal()
+                    source_tag = "heuristic"
+
                 action, data = self.planner.select_action(goal, self.space, self.action_space)
             else:
                 action, data = random.choice(self.action_space), {}
+                source_tag = "random"
+                goal = None
             target_id = None
-            goal = self.goal_inf.best_goal()
-            source = f"plan({goal.goal_type.value if goal else '?'})"
+            source = f"plan/{source_tag}({goal.goal_type.value if goal else '?'})"
 
         # Stuck detection: count repeated (action, data) from planner
         current_ad = (action, tuple(sorted((data or {}).items())))
@@ -262,6 +283,13 @@ class ObjectCentricAgent:
             else:
                 self._planner_stuck_count = 0
         self._prev_action_data = current_ad
+
+        # Log action to ReAct for context
+        changed_count = len([
+            e for e in self.space.objects.values()
+            if e.interestingness > 0
+        ])
+        self.react.log_action(action.name, data or {}, changed_count)
 
         # Periodic KnowledgeSpace training
         if self._action_count % 20 == 0:
