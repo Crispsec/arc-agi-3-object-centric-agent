@@ -42,6 +42,7 @@ from embedding_space import EmbeddingSpace
 from curiosity_explorer import CuriosityExplorer, MEANING_DIM, compute_delta
 from relational_transformer import RelationalTransformer, InteractionMemory, InteractionRecord, EFFECT_DIM
 from goal_planner import GoalInferenceModule, Planner, GoalHypothesis
+from knowledge_space import KnowledgeSpace
 
 
 log = logging.getLogger(__name__)
@@ -107,10 +108,18 @@ class ObjectCentricAgent:
         action_space: List[GameAction],
         confidence_threshold: float = 0.3,
         min_object_size: int = 2,
+        plan_ready_pct: float = 0.7,
+        explore_budget_pct: float = 0.3,
+        stuck_threshold: int = 5,
+        baseline_actions: int = 300,
         verbose: bool = True,
     ):
         self.action_space = action_space
         self.confidence_threshold = confidence_threshold
+        self.plan_ready_pct = plan_ready_pct
+        self.explore_budget_pct = explore_budget_pct
+        self.stuck_threshold = stuck_threshold
+        self._estimated_baseline: int = max(1, baseline_actions)
         self.verbose = verbose
 
         # Components
@@ -124,6 +133,7 @@ class ObjectCentricAgent:
         self.rt = RelationalTransformer(input_dim=INPUT_DIM)
         self.goal_inf = GoalInferenceModule()
         self.planner = Planner()
+        self.knowledge = KnowledgeSpace()
 
         # State
         self._prev_blobs: List[ObjectBlob] = []
@@ -133,6 +143,8 @@ class ObjectCentricAgent:
         self._level: int = 0
         self._level_stats: List[LevelStats] = []
         self._current_stats: LevelStats = LevelStats(level=0)
+        self._planner_stuck_count: int = 0
+        self._prev_action_data: tuple = (None, {})
 
         # Cross-level priors: (color, shape_hash) → ObjectPrior
         self._priors: Dict[Tuple[int, int], ObjectPrior] = {}
@@ -198,9 +210,26 @@ class ObjectCentricAgent:
             self._record_interaction(blobs)
 
         unknown = self.space.get_unknown_objects(self.confidence_threshold)
+        total_significant = len([
+            e for e in self.space.objects.values()
+            if e.properties.get("size", 0) >= 2
+        ])
+        unknown_pct = len(unknown) / max(total_significant, 1)
+        explore_budget_used = self._action_count / self._estimated_baseline
+
+        # Hybrid explore-exploit policy
+        should_explore = (
+            len(unknown) > 0
+            and unknown_pct > (1.0 - self.plan_ready_pct)   # >30% still unknown
+            and explore_budget_used < self.explore_budget_pct  # haven't burned budget
+        )
+        # If planner is stuck, inject one exploration step to break the loop
+        if self._planner_stuck_count >= self.stuck_threshold and len(unknown) > 0:
+            should_explore = True
+            self._planner_stuck_count = 0
 
         # 4. Exploration branch
-        if unknown:
+        if should_explore:
             self._current_stats.exploration_steps += 1
             action, data, target_id = self.explorer.select_action(self.space)
             if action is None:
@@ -224,6 +253,19 @@ class ObjectCentricAgent:
             target_id = None
             goal = self.goal_inf.best_goal()
             source = f"plan({goal.goal_type.value if goal else '?'})"
+
+        # Stuck detection: count repeated (action, data) from planner
+        current_ad = (action, tuple(sorted((data or {}).items())))
+        if not should_explore:
+            if current_ad == self._prev_action_data:
+                self._planner_stuck_count += 1
+            else:
+                self._planner_stuck_count = 0
+        self._prev_action_data = current_ad
+
+        # Periodic KnowledgeSpace training
+        if self._action_count % 20 == 0:
+            self.knowledge.train()
 
         self._prev_blobs = blobs
         self._prev_action = action
@@ -289,10 +331,25 @@ class ObjectCentricAgent:
 
     def _record_interaction(self, after_blobs: List[ObjectBlob]) -> None:
         target_id = self._prev_target_id
-        delta = compute_delta(target_id, self._prev_blobs, after_blobs)
-        self.space.update_meaning(target_id, delta[:MEANING_DIM])
 
+        # record_interaction now returns (delta, reactor_ids) and handles
+        # meaning updates for both target and reactors
+        delta, reactor_ids = self.explorer.record_interaction(
+            target_id, self._prev_blobs, after_blobs, self.space
+        )
+
+        # Label target if it has accumulated meaning
         target_entry = self.space.get_entry(target_id)
+        if target_entry is not None and target_entry.meaning_vector.norm() > 0.01:
+            self.knowledge.lookup_and_label(target_entry)
+            self.knowledge.record_training_sample(target_entry.meaning_vector, delta)
+
+        # Label reactors
+        for rid in reactor_ids:
+            r_entry = self.space.get_entry(rid)
+            if r_entry is not None:
+                self.knowledge.lookup_and_label(r_entry)
+
         if target_entry is None:
             return
 
@@ -350,7 +407,12 @@ def run_game(
         raise RuntimeError(f"Could not create environment {game_id}")
     env.include_frame_data = True
 
-    agent = ObjectCentricAgent(action_space=env.action_space, verbose=verbose)
+    baseline_sum = sum(env.environment_info.baseline_actions)
+    agent = ObjectCentricAgent(
+        action_space=env.action_space,
+        baseline_actions=baseline_sum,
+        verbose=verbose,
+    )
 
     obs = env.reset()
     grid = obs.frame[0]

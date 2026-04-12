@@ -111,7 +111,7 @@ def compute_delta(
         delta[8] = 1.0
 
     # --- dim 9: other objects changed ---
-    changed_count = _count_changed_objects(before_blobs, after_blobs, exclude_id=target_id)
+    changed_count = len(_find_changed_objects(before_blobs, after_blobs, exclude_id=target_id))
     if changed_count > 0:
         delta[9] = 1.0
     # dim 10: normalised count of other changes
@@ -154,26 +154,90 @@ def _find_closest_same_color(
     return best
 
 
+def _find_changed_objects(
+    before_blobs: List[ObjectBlob],
+    after_blobs: List[ObjectBlob],
+    exclude_id: str,
+) -> List[Tuple[ObjectBlob, Optional[ObjectBlob]]]:
+    """
+    Find non-target objects that moved or disappeared.
+
+    Returns a list of (blob_before, blob_after_or_None) tuples.
+    blob_after is None when the object disappeared.
+    """
+    before_map = {b.object_id: b for b in before_blobs if b.object_id != exclude_id}
+    after_map = {b.object_id: b for b in after_blobs if b.object_id != exclude_id}
+
+    changed: List[Tuple[ObjectBlob, Optional[ObjectBlob]]] = []
+    for oid, b_before in before_map.items():
+        b_after = after_map.get(oid)
+        if b_after is None:
+            changed.append((b_before, None))  # disappeared
+        else:
+            dr = abs(b_after.centroid[0] - b_before.centroid[0])
+            dc = abs(b_after.centroid[1] - b_before.centroid[1])
+            if dr + dc > 1.0:
+                changed.append((b_before, b_after))  # moved
+    return changed
+
+
 def _count_changed_objects(
     before_blobs: List[ObjectBlob],
     after_blobs: List[ObjectBlob],
     exclude_id: str,
 ) -> int:
     """Count how many non-target objects changed position or disappeared."""
-    before_map = {b.object_id: b for b in before_blobs if b.object_id != exclude_id}
-    after_map = {b.object_id: b for b in after_blobs if b.object_id != exclude_id}
+    return len(_find_changed_objects(before_blobs, after_blobs, exclude_id))
 
-    changed = 0
-    for oid, b_before in before_map.items():
-        b_after = after_map.get(oid)
-        if b_after is None:
-            changed += 1  # disappeared
-        else:
-            dr = abs(b_after.centroid[0] - b_before.centroid[0])
-            dc = abs(b_after.centroid[1] - b_before.centroid[1])
-            if dr + dc > 1.0:
-                changed += 1  # moved
-    return changed
+
+def compute_reactor_delta(
+    reactor_before: ObjectBlob,
+    reactor_after: Optional[ObjectBlob],
+) -> torch.Tensor:
+    """
+    Encode what happened to a reactor object (dims 11-15 of the meaning space).
+
+    Dims layout (within the returned 32-dim tensor):
+      dim 11: moved north (normalised /64)
+      dim 12: moved south
+      dim 13: moved west
+      dim 14: moved east
+      dim 15: disappeared (1.0)
+    All other dims are 0.
+    """
+    delta = np.zeros(MEANING_DIM, dtype=np.float32)
+    if reactor_after is None:
+        delta[15] = 1.0
+    else:
+        dr = reactor_after.centroid[0] - reactor_before.centroid[0]
+        dc = reactor_after.centroid[1] - reactor_before.centroid[1]
+        delta[11] = max(0.0, -dr) / 64.0   # north
+        delta[12] = max(0.0,  dr) / 64.0   # south
+        delta[13] = max(0.0, -dc) / 64.0   # west
+        delta[14] = max(0.0,  dc) / 64.0   # east
+    return torch.tensor(delta, dtype=torch.float32)
+
+
+def _resolve_reactor_id(
+    blob_before: ObjectBlob,
+    space: EmbeddingSpace,
+) -> Optional[str]:
+    """
+    Find the current object_id in space for a reactor blob (by color + centroid).
+    Returns None if not found.
+    """
+    best_id = None
+    best_dist = 4.0  # max 2px centroid drift before we give up
+    for oid, entry in space.objects.items():
+        if entry.properties.get("color") != blob_before.color:
+            continue
+        cr, cc = entry.properties["centroid"]
+        br, bc = blob_before.centroid
+        dist = abs(cr - br) + abs(cc - bc)
+        if dist < best_dist:
+            best_dist = dist
+            best_id = oid
+    return best_id
 
 
 # ------------------------------------------------------------------
@@ -300,15 +364,32 @@ class CuriosityExplorer:
         before_blobs: List[ObjectBlob],
         after_blobs: List[ObjectBlob],
         space: EmbeddingSpace,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, List[str]]:
         """
         Compute the delta from an interaction and apply it to the embedding space.
+        Also updates reactor objects (objects that moved/disappeared as a side-effect).
 
-        Returns the delta tensor (for logging / relational transformer memory).
+        Returns
+        -------
+        delta : torch.Tensor [MEANING_DIM] — target interaction delta
+        reactor_ids : List[str] — space IDs of reactor objects that were updated
         """
         delta = compute_delta(target_id, before_blobs, after_blobs)
         space.update_meaning(target_id, delta[:space.meaning_dim])
-        return delta
+
+        # Update reactor objects
+        reactor_ids: List[str] = []
+        changed = _find_changed_objects(before_blobs, after_blobs, exclude_id=target_id)
+        for blob_before, blob_after in changed:
+            rid = _resolve_reactor_id(blob_before, space)
+            if rid is None:
+                continue
+            reactor_delta = compute_reactor_delta(blob_before, blob_after)
+            space.update_meaning(rid, reactor_delta)
+            space.boost_interestingness(rid, amount=0.3)
+            reactor_ids.append(rid)
+
+        return delta, reactor_ids
 
 
 def _dominant_direction(dr: float, dc: float) -> str:
@@ -363,8 +444,10 @@ if __name__ == "__main__":
         after_blobs = extractor(obs.frame[0])
         space.update(after_blobs)
 
-        delta = explorer.record_interaction(target_id, before_blobs, after_blobs, space)
+        delta, reactor_ids = explorer.record_interaction(target_id, before_blobs, after_blobs, space)
         interaction_log.append((target_id, action, delta))
+        if reactor_ids:
+            print(f"         → reactors updated: {[r[:8] for r in reactor_ids]}")
 
         updated_entry = space.get_entry(target_id)
         if updated_entry:

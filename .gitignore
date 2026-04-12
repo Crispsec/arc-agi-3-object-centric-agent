@@ -13,6 +13,9 @@ environment_files/
 # Replay frames and GIFs (generated output)
 replays/
 
+# Trained projector checkpoint (regenerated from self-supervised training)
+knowledge_space_projector.pt
+
 # Zone identifiers (Windows WSL artefacts)
 *.Zone.Identifier
 *:Zone.Identifier

@@ -86,8 +86,10 @@ def evaluate_game(
         return {"game_id": game_id, "error": "failed to create environment"}
     env.include_frame_data = True
 
+    baseline_sum = sum(env.environment_info.baseline_actions)
     agent = ObjectCentricAgent(
         action_space=env.action_space,
+        baseline_actions=baseline_sum,
         verbose=verbose,
     )
 

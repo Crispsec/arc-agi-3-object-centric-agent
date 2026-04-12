@@ -52,6 +52,35 @@ from relational_transformer import WorldState
 
 
 # ------------------------------------------------------------------
+# Concept category sets (for hypothesis type biasing)
+# ------------------------------------------------------------------
+
+_KEY_CONCEPTS = frozenset({
+    "key object",
+    "collectible item",
+    "activates another object when reached",
+    "causes chain reaction when touched",
+    "switches state when touched",
+    "trigger when stepped on",
+})
+
+_DOOR_CONCEPTS = frozenset({
+    "door or gate",
+    "goal or target location",
+    "opens when key is nearby",
+    "blocks movement",
+    "wall or obstacle",
+})
+
+_ENEMY_CONCEPTS = frozenset({
+    "enemy or hazard",
+    "red dangerous object",
+    "small orange enemy",
+    "destroys other objects on contact",
+})
+
+
+# ------------------------------------------------------------------
 # Hypothesis types
 # ------------------------------------------------------------------
 
@@ -211,9 +240,20 @@ class GoalInferenceModule:
             if (oid_a, oid_b) in existing_pairs:
                 continue
 
-            # Default: hypothesise BRING (positive reward for proximity)
+            # Concept-biased hypothesis type selection
+            concept_a = getattr(space.get_entry(oid_a), "visual_concept", "")
+            concept_b = getattr(space.get_entry(oid_b), "visual_concept", "")
+
+            if concept_a in _ENEMY_CONCEPTS or concept_b in _ENEMY_CONCEPTS:
+                goal_type = GoalType.AVOID
+            elif (concept_a in _KEY_CONCEPTS and concept_b in _DOOR_CONCEPTS) or \
+                 (concept_b in _KEY_CONCEPTS and concept_a in _DOOR_CONCEPTS):
+                goal_type = GoalType.BRING
+            else:
+                goal_type = GoalType.BRING  # default
+
             h = GoalHypothesis(
-                goal_type=GoalType.BRING,
+                goal_type=goal_type,
                 object_a=oid_a,
                 object_b=oid_b,
                 probability=0.15,

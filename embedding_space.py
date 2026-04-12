@@ -48,6 +48,9 @@ class ObjectEntry:
     confidence: float = 0.0
     age: int = 0
     last_seen: int = 0
+    interestingness: float = 0.0        # boosted when this object reacts to interactions
+    visual_concept: str = ""            # e.g. "moves when pushed" (from KnowledgeSpace)
+    concept_confidence: float = 0.0     # cosine similarity to nearest concept
 
 
 # ------------------------------------------------------------------
@@ -219,6 +222,12 @@ class EmbeddingSpace:
     # Meaning updates (called by CuriosityExplorer after interactions)
     # ------------------------------------------------------------------
 
+    def boost_interestingness(self, object_id: str, amount: float = 0.3) -> None:
+        """Boost interestingness score when this object reacts to an interaction."""
+        if object_id in self.objects:
+            entry = self.objects[object_id]
+            entry.interestingness = min(2.0, entry.interestingness + amount)
+
     def update_meaning(self, object_id: str, delta: torch.Tensor) -> None:
         """
         Accumulate a delta vector into an object's meaning.
@@ -235,10 +244,11 @@ class EmbeddingSpace:
     # ------------------------------------------------------------------
 
     def get_unknown_objects(
-        self, threshold: float = 0.3, min_size: int = 10
+        self, threshold: float = 0.3, min_size: int = 10,
+        sort_by: str = "priority",
     ) -> List[str]:
         """
-        Object IDs sorted by confidence ascending (least known first).
+        Object IDs sorted by exploration priority.
 
         Parameters
         ----------
@@ -247,15 +257,24 @@ class EmbeddingSpace:
         min_size : int
             Only return objects with at least this many pixels.
             Tiny fragments (noise) are not worth targeting.
+        sort_by : str
+            "priority" (default): rank by -(interestingness + 1e-3) * (1 - confidence)
+                — high interestingness, low confidence objects first.
+            "confidence": sort ascending by confidence only (legacy behaviour).
         """
-        unknown = [
-            (oid, e.confidence)
+        candidates = [
+            (oid, e)
             for oid, e in self.objects.items()
             if e.confidence < threshold
             and e.properties.get("size", 0) >= min_size
         ]
-        unknown.sort(key=lambda x: x[1])
-        return [oid for oid, _ in unknown]
+        if sort_by == "priority":
+            candidates.sort(
+                key=lambda x: -(x[1].interestingness + 1e-3) * (1.0 - x[1].confidence)
+            )
+        else:
+            candidates.sort(key=lambda x: x[1].confidence)
+        return [oid for oid, _ in candidates]
 
     def get_entry(self, object_id: str) -> Optional[ObjectEntry]:
         return self.objects.get(object_id)
