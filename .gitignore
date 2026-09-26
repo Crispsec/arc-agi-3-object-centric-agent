@@ -19,3 +19,6 @@ knowledge_space_projector.pt
 # Zone identifiers (Windows WSL artefacts)
 *.Zone.Identifier
 *:Zone.Identifier
+
+# Local assistant settings
+.claude/

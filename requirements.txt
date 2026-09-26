@@ -1,2 +1,8 @@
+arc-agi>=0.9.6
+arcengine>=0.9.3
+torch
+numpy
+scipy
+matplotlib
 sentence-transformers>=2.7.0
-anthropic>=0.40.0
+ollama
