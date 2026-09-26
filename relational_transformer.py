@@ -32,9 +32,12 @@ from collections import deque
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
+import random
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.optim import Adam
 
 
 # ------------------------------------------------------------------
@@ -115,6 +118,47 @@ class InteractionMemory:
 
 
 # ------------------------------------------------------------------
+# Causal Predictor
+# ------------------------------------------------------------------
+
+class CausalPredictor(nn.Module):
+    """
+    Predicts the effect of an action on a pair of objects.
+
+    Input:  concat(obj_a[input_dim], action_onehot[n_actions], obj_b[input_dim])
+    Output: predicted_effect[effect_dim]
+
+    Trained online via MSE against actual effect_embed from InteractionMemory.
+    Once trained, the weights in R[i,j] reflect real causal structure
+    rather than random noise.
+    """
+
+    def __init__(
+        self,
+        input_dim: int = 96,
+        n_actions: int = 8,
+        effect_dim: int = EFFECT_DIM,
+        hidden_dim: int = 128,
+    ):
+        super().__init__()
+        in_features = input_dim * 2 + n_actions
+        self.net = nn.Sequential(
+            nn.Linear(in_features, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, effect_dim),
+        )
+
+    def forward(
+        self,
+        obj_a: torch.Tensor,      # [B, input_dim]
+        action: torch.Tensor,     # [B, n_actions] one-hot
+        obj_b: torch.Tensor,      # [B, input_dim]
+    ) -> torch.Tensor:            # [B, effect_dim]
+        x = torch.cat([obj_a, action, obj_b], dim=-1)
+        return self.net(x)
+
+
+# ------------------------------------------------------------------
 # Relational Transformer
 # ------------------------------------------------------------------
 
@@ -137,12 +181,19 @@ class RelationalTransformer(nn.Module):
         relation_dim: int = 16,
         summary_dim: int = 64,
         memory_token_dim: int = 120,    # input_dim(96) + n_actions(8) + effect_dim(16)
+        n_actions: int = 8,
         dropout: float = 0.0,
     ):
         super().__init__()
         self.input_dim = input_dim
         self.relation_dim = relation_dim
         self.summary_dim = summary_dim
+        self.n_actions = n_actions
+
+        # Causal predictor — trained online on InteractionMemory
+        self.causal = CausalPredictor(input_dim=input_dim, n_actions=n_actions, effect_dim=EFFECT_DIM)
+        self._causal_optimizer = Adam(self.causal.parameters(), lr=1e-3)
+        self._train_buffer: deque = deque(maxlen=2000)
 
         # Project object embeddings to transformer working dim
         # (keep same dim, just normalise)
@@ -231,6 +282,40 @@ class RelationalTransformer(nn.Module):
             world_summary=world_summary,
             object_ids=object_ids,
         )
+
+    # ------------------------------------------------------------------
+
+    def train_step(self, memory: InteractionMemory) -> float:
+        """
+        Sample a batch from InteractionMemory and train the CausalPredictor.
+
+        The predictor learns: given (obj_a, action, obj_b) → predict effect.
+        Once trained, the relation weights R[i,j] from the transformer encoder
+        start reflecting real causal structure rather than random noise.
+
+        Returns mean MSE loss (0.0 if buffer too small).
+        """
+        if len(memory) < 8:
+            return 0.0
+
+        records = list(memory._buffer)
+        batch = random.sample(records, min(32, len(records)))
+
+        obj_a = torch.stack([r.obj_a_embed for r in batch])        # [B, input_dim]
+        obj_b = torch.stack([r.obj_b_embed for r in batch])        # [B, input_dim]
+        effects = torch.stack([r.effect_embed[:EFFECT_DIM] for r in batch])  # [B, effect_dim]
+
+        action_ids = torch.tensor([r.action_id for r in batch], dtype=torch.long)
+        action_oh = F.one_hot(action_ids, num_classes=self.n_actions).float()  # [B, n_actions]
+
+        pred = self.causal(obj_a, action_oh, obj_b)
+        loss = F.mse_loss(pred, effects)
+
+        self._causal_optimizer.zero_grad()
+        loss.backward()
+        self._causal_optimizer.step()
+
+        return loss.item()
 
 
 # ------------------------------------------------------------------

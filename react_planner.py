@@ -19,9 +19,12 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 from typing import Dict, List, Optional
 
 import ollama
+
+from dataclasses import dataclass, field
 
 from embedding_space import EmbeddingSpace, ObjectEntry
 from goal_planner import GoalHypothesis, GoalType
@@ -32,6 +35,30 @@ DEFAULT_MODEL = "qwen3:4b"
 MAX_TOKENS = 600
 HISTORY_TURNS = 6          # keep last N user+assistant pairs
 CALL_EVERY_N_STEPS = 15
+STREAM_TIMEOUT_SEC = 15    # abort streaming if no chunk arrives within this window
+
+
+# ------------------------------------------------------------------
+# Color names
+# ------------------------------------------------------------------
+
+# ------------------------------------------------------------------
+# Action plan (open goal system)
+# ------------------------------------------------------------------
+
+@dataclass
+class ActionPlan:
+    """
+    Open-ended plan produced by the LLM.
+
+    goal        : natural language description of what to achieve
+    actions     : ordered list of (action_name, data) to execute
+    fallback_goal: a GoalHypothesis to hand to the heuristic planner
+                   if the action queue runs out with no replan
+    """
+    goal: str
+    actions: list = field(default_factory=list)   # list of {"action": str, "x": int, "y": int}
+    fallback_goal: Optional[GoalHypothesis] = None
 
 
 # ------------------------------------------------------------------
@@ -103,25 +130,26 @@ def _strip_thinking(text: str) -> str:
     return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
 
-def _parse_goal(response_text: str, space: EmbeddingSpace) -> Optional[GoalHypothesis]:
+def _parse_action_plan(response_text: str, space: EmbeddingSpace) -> Optional[ActionPlan]:
     """
-    Extract a GoalHypothesis from the LLM's JSON block.
+    Extract an ActionPlan from the LLM's JSON block.
 
-    Expected format anywhere in the response:
+    Expected format:
     ```json
     {
-      "goal_type": "bring" | "avoid" | "reach",
-      "object_a": "<6-char ID prefix or color name>",
-      "object_b": "<6-char ID prefix or color name>",
+      "goal": "natural language goal",
+      "actions": [{"action": "CLICK", "x": 14, "y": 36}, {"action": "RIGHT"}],
       "reasoning": "one sentence"
     }
     ```
+
+    Also accepts the old GoalHypothesis format as a fallback.
     """
     text = _strip_thinking(response_text)
 
     match = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL)
     if not match:
-        match = re.search(r"\{[^{}]*\"goal_type\"[^{}]*\}", text, re.DOTALL)
+        match = re.search(r"\{[^{}]*\"(?:goal|goal_type)\"[^{}]*\}", text, re.DOTALL)
     if not match:
         return None
 
@@ -131,30 +159,47 @@ def _parse_goal(response_text: str, space: EmbeddingSpace) -> Optional[GoalHypot
     except json.JSONDecodeError:
         return None
 
-    # Accept "goal_type" or "goal" (model sometimes uses shorter key)
-    raw_type = data.get("goal_type") or data.get("goal", "bring")
-    goal_type = {
-        "bring": GoalType.BRING,
-        "avoid": GoalType.AVOID,
-        "reach": GoalType.REACH,
-    }.get(raw_type.lower(), GoalType.BRING)
-
-    oid_a = _resolve_ref(str(data.get("object_a", "")), space)
-    oid_b = _resolve_ref(str(data.get("object_b", "")), space) if data.get("object_b") else None
-
-    if oid_a is None:
-        return None
-
     reasoning = data.get("reasoning", "")
     if reasoning:
         log.info(f"[ReAct] {reasoning}")
 
-    return GoalHypothesis(
-        goal_type=goal_type,
-        object_a=oid_a,
-        object_b=oid_b,
-        probability=0.8,
-    )
+    # New open-goal format
+    if "actions" in data:
+        goal_text = data.get("goal", "unknown goal")
+        actions = data.get("actions", [])
+        # Build a fallback GoalHypothesis from the first CLICK target if available
+        fallback = _actions_to_fallback(actions, space)
+        return ActionPlan(goal=goal_text, actions=actions, fallback_goal=fallback)
+
+    # Legacy format: {"goal_type": ..., "object_a": ..., "object_b": ...}
+    raw_type = data.get("goal_type") or data.get("goal", "bring")
+    if isinstance(raw_type, str) and raw_type.lower() in ("bring", "avoid", "reach"):
+        goal_type = {"bring": GoalType.BRING, "avoid": GoalType.AVOID, "reach": GoalType.REACH}[raw_type.lower()]
+        oid_a = _resolve_ref(str(data.get("object_a", "")), space)
+        oid_b = _resolve_ref(str(data.get("object_b", "")), space) if data.get("object_b") else None
+        if oid_a is None:
+            return None
+        fallback = GoalHypothesis(goal_type=goal_type, object_a=oid_a, object_b=oid_b, probability=0.8)
+        return ActionPlan(goal=f"{raw_type} {oid_a[:6]}", actions=[], fallback_goal=fallback)
+
+    return None
+
+
+def _actions_to_fallback(actions: list, space: EmbeddingSpace) -> Optional[GoalHypothesis]:
+    """Build a rough GoalHypothesis from the first CLICK in the action list."""
+    for act in actions:
+        if act.get("action") == "CLICK":
+            x, y = act.get("x", 0), act.get("y", 0)
+            # Find nearest object to (y, x) = (row, col)
+            best_oid, best_dist = None, float("inf")
+            for oid, entry in space.objects.items():
+                cr, cc = entry.properties.get("centroid", (0, 0))
+                d = ((cr - y) ** 2 + (cc - x) ** 2) ** 0.5
+                if d < best_dist:
+                    best_dist, best_oid = d, oid
+            if best_oid:
+                return GoalHypothesis(goal_type=GoalType.REACH, object_a=best_oid, probability=0.7)
+    return None
 
 
 def _resolve_ref(ref: str, space: EmbeddingSpace) -> Optional[str]:
@@ -188,37 +233,42 @@ def _resolve_ref(ref: str, space: EmbeddingSpace) -> Optional[str]:
 
 SYSTEM_PROMPT = """You are the reasoning engine for an AI agent playing unknown puzzle games on a 64x64 grid.
 
-The agent has a low-level executor that can click objects or use directional keys.
-Your job: reason about what the puzzle mechanic is, then output a concrete goal.
+The agent executor supports:
+  CLICK x y        — click a specific grid cell
+  UP / DOWN / LEFT / RIGHT  — directional moves (no coordinates needed)
 
-You receive a game state summary with:
-- Known objects: color, size, position, learned concept, interestingness score
-- Recent actions and whether they caused changes
+Your job:
+1. Reason about what the puzzle mechanic is (step by step).
+2. Output a natural language goal AND a concrete action plan.
 
-Rules:
-1. Think step by step about what the puzzle mechanic might be.
-2. High interestingness = that object reacted when something touched it. Important.
-3. Concepts like "key object", "causes chain reaction", "activates another object" are strong signals.
-4. If the agent keeps repeating the same action with no change, propose something different.
-5. Output your reasoning in plain text, then end with exactly one JSON block.
+You receive:
+- Known objects: [ID] size color @ (row,col) concept='...' conf=N.NN interest=N.N
+- Recent actions with outcome (→ N object(s) changed)
 
-JSON format:
+Guidelines:
+- High interestingness means the object reacted to something — it matters.
+- Objects with concept 'enemy or hazard' are dangerous — avoid clicking them.
+- If actions keep having no effect, try a different object or direction.
+- Batch 3-5 actions per plan. The agent replans automatically if something changes.
+- Prefer CLICK (row, col) for objects. Use directional keys only if no clear target.
+
+Output format — one JSON block at the end of your reasoning:
 ```json
 {
-  "goal_type": "bring",
-  "object_a": "<6-char object ID or color name>",
-  "object_b": "<6-char object ID or color name>",
-  "reasoning": "one sentence why"
+  "goal": "one sentence describing what you are trying to achieve",
+  "actions": [
+    {"action": "CLICK", "x": 14, "y": 36},
+    {"action": "RIGHT"},
+    {"action": "CLICK", "x": 28, "y": 10}
+  ],
+  "reasoning": "one sentence why this plan makes sense"
 }
 ```
 
-goal_type options:
-- "bring": move object_a near object_b (key→door, block→target, player→switch)
-- "avoid": keep object_a away from object_b (hazard avoidance)
-- "reach": navigate toward object_b using object_a as the mover
-
-Always output exactly one JSON block. Use the 6-char ID prefix shown in brackets when available.
-If unsure, pick the two highest-interestingness objects and try "bring"."""
+action values: CLICK (requires x=col, y=row), UP, DOWN, LEFT, RIGHT
+x = column (0-63), y = row (0-63)
+Object positions are shown as (row, col). For CLICK: x=col, y=row.
+Always output exactly one JSON block."""
 
 
 # ------------------------------------------------------------------
@@ -245,7 +295,7 @@ class ReActPlanner:
         self.model = model
         self.call_every = call_every
         self._history: List[Dict[str, str]] = []
-        self._last_goal: Optional[GoalHypothesis] = None
+        self._last_plan: Optional[ActionPlan] = None
         self._last_call_step: int = -999
         self._action_log: List[str] = []
         self._available: Optional[bool] = None   # lazily checked
@@ -289,9 +339,9 @@ class ReActPlanner:
         space: EmbeddingSpace,
         step: int,
         level: int,
-    ) -> Optional[GoalHypothesis]:
+    ) -> Optional[ActionPlan]:
         """
-        Query the local LLM and return a GoalHypothesis.
+        Query the local LLM and return an ActionPlan.
         Returns None on failure — caller uses heuristic fallback.
         """
         if not self.available:
@@ -308,7 +358,9 @@ class ReActPlanner:
         messages = [{"role": "system", "content": SYSTEM_PROMPT}] + self._history
 
         try:
-            # Stream response — qwen3 exhausts num_predict on thinking if not streamed
+            # Stream response — qwen3 exhausts num_predict on thinking if not streamed.
+            # Use a per-chunk timeout: if no chunk arrives within STREAM_TIMEOUT_SEC,
+            # a daemon thread sets the stop_event and we break out of the loop.
             stream = ollama.chat(
                 model=self.model,
                 messages=messages,
@@ -316,33 +368,57 @@ class ReActPlanner:
                 options={"temperature": 0.3},
             )
             content_parts = []
+            timed_out = False
+            stop_event = threading.Event()
+
+            def _watchdog():
+                if not stop_event.wait(timeout=STREAM_TIMEOUT_SEC):
+                    nonlocal timed_out
+                    timed_out = True
+
+            watchdog = threading.Thread(target=_watchdog, daemon=True)
+            watchdog.start()
+
             for chunk in stream:
+                if timed_out:
+                    log.warning(f"[ReAct] Stream timeout after {STREAM_TIMEOUT_SEC}s — aborting")
+                    break
+                # Reset watchdog on each received chunk
+                stop_event.set()
+                stop_event = threading.Event()
+                watchdog = threading.Thread(target=_watchdog, daemon=True)
+                watchdog.start()
                 if chunk.message.content:
                     content_parts.append(chunk.message.content)
+
+            stop_event.set()  # signal last watchdog to exit
             text = "".join(content_parts)
+
+            if timed_out and not text:
+                log.warning("[ReAct] Timed out with no content — using last valid goal")
+                return self._last_goal
             self._history.append({"role": "assistant", "content": text})
 
-            goal = _parse_goal(text, space)
-            if goal is not None:
-                self._last_goal = goal
+            plan = _parse_action_plan(text, space)
+            if plan is not None:
+                self._last_plan = plan
                 log.info(
-                    f"[ReAct] step={step} → {goal.goal_type.value} "
-                    f"a={goal.object_a[:6]} "
-                    f"b={goal.object_b[:6] if goal.object_b else 'None'}"
+                    f"[ReAct] step={step} → goal='{plan.goal}' "
+                    f"actions={len(plan.actions)}"
                 )
             else:
-                log.warning(f"[ReAct] Could not parse goal. Response: {_strip_thinking(text)[:200]}")
+                log.warning(f"[ReAct] Could not parse plan. Response: {_strip_thinking(text)[:200]}")
 
-            return goal
+            return plan
 
         except Exception as e:
             log.warning(f"[ReAct] Inference failed: {e}")
-            return self._last_goal
+            return self._last_plan
 
     def reset(self) -> None:
         """Call at the start of each level — clears conversation history."""
         self._history = []
-        self._last_goal = None
+        self._last_plan = None
         self._last_call_step = -999
         self._action_log = []
 

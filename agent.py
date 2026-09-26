@@ -43,7 +43,7 @@ from curiosity_explorer import CuriosityExplorer, MEANING_DIM, compute_delta
 from relational_transformer import RelationalTransformer, InteractionMemory, InteractionRecord, EFFECT_DIM
 from goal_planner import GoalInferenceModule, Planner, GoalHypothesis
 from knowledge_space import KnowledgeSpace
-from react_planner import ReActPlanner
+from react_planner import ReActPlanner, ActionPlan
 
 
 log = logging.getLogger(__name__)
@@ -147,6 +147,11 @@ class ObjectCentricAgent:
         self._current_stats: LevelStats = LevelStats(level=0)
         self._planner_stuck_count: int = 0
         self._prev_action_data: tuple = (None, {})
+        self._prev_score: float = 0.0
+
+        # Action queue from open-goal LLM plan
+        self._action_queue: List[dict] = []   # list of {"action": str, ...}
+        self._current_plan_goal: str = ""
 
         # Cross-level priors: (color, shape_hash) → ObjectPrior
         self._priors: Dict[Tuple[int, int], ObjectPrior] = {}
@@ -166,6 +171,9 @@ class ObjectCentricAgent:
         self.memory.clear()
         self.goal_inf = GoalInferenceModule()
         self.react.reset()
+        self._action_queue = []
+        self._current_plan_goal = ""
+        self._prev_score = 0.0
 
         # Extract initial objects
         blobs = self.extractor(grid)
@@ -242,6 +250,14 @@ class ObjectCentricAgent:
         else:
             # 5-7. Planning branch
             self._current_stats.planning_steps += 1
+
+            # Detect score change → invalidate the action queue so we replan
+            current_score = getattr(game_state, "score", None) or 0.0
+            if current_score != self._prev_score and self._action_queue:
+                log.info(f"[Agent] Score changed ({self._prev_score}→{current_score}) — clearing action queue")
+                self._action_queue = []
+            self._prev_score = current_score
+
             mat = self.space.to_matrix()
             if mat is not None:
                 oids = self.space.object_ids()
@@ -250,32 +266,66 @@ class ObjectCentricAgent:
                     world_state = self.rt(mat, oids, mem_tensor)
                 self.goal_inf.update(self.space, world_state, game_state)
 
-                # ReAct: query LLM when periodic or stuck
+                # ReAct: query LLM when periodic/stuck OR queue is empty
+                queue_empty = len(self._action_queue) == 0
                 if self.react.should_call(
                     self._action_count, self._planner_stuck_count, self.stuck_threshold
-                ):
-                    react_goal = self.react.reason(
+                ) or queue_empty:
+                    react_plan = self.react.reason(
                         self.space, self._action_count, self._level
                     )
-                    if react_goal is not None:
-                        goal = react_goal
+                    if react_plan is not None and react_plan.actions:
+                        self._action_queue = list(react_plan.actions)
+                        self._current_plan_goal = react_plan.goal
                         source_tag = "react"
+                    elif react_plan is not None and react_plan.fallback_goal is not None:
+                        # Plan has no explicit action steps — use fallback goal via heuristic
+                        goal = react_plan.fallback_goal
+                        action, data = self.planner.select_action(goal, self.space, self.action_space)
+                        source_tag = "react-fallback"
+                        target_id = None
+                        source = f"plan/{source_tag}"
+                        # Skip queue pop
+                        self._do_stuck_detection(action, data, should_explore)
+                        self._log_action(action, data)
+                        self._save_prev(blobs, action, target_id)
+                        self._maybe_train()
+                        self._log_step(source, unknown, action, data)
+                        return action, data
                     else:
-                        goal = self.goal_inf.best_goal()
                         source_tag = "heuristic"
-                else:
-                    goal = self.goal_inf.best_goal()
-                    source_tag = "heuristic"
 
-                action, data = self.planner.select_action(goal, self.space, self.action_space)
+                # Execute next action from queue if available
+                if self._action_queue:
+                    raw_act = self._action_queue.pop(0)
+                    action, data, target_id = self._decode_queued_action(raw_act)
+                    source_tag = f"queue({self._current_plan_goal[:20]})"
+                else:
+                    # Queue empty and no new plan — fall back to heuristic
+                    goal = self.goal_inf.best_goal()
+                    action, data = self.planner.select_action(goal, self.space, self.action_space)
+                    source_tag = "heuristic"
+                    target_id = None
             else:
                 action, data = random.choice(self.action_space), {}
                 source_tag = "random"
                 goal = None
-            target_id = None
-            source = f"plan/{source_tag}({goal.goal_type.value if goal else '?'})"
+                target_id = None
+            source = f"plan/{source_tag}"
 
-        # Stuck detection: count repeated (action, data) from planner
+        self._do_stuck_detection(action, data, should_explore)
+        self._log_action(action, data)
+        self._save_prev(blobs, action, target_id)
+        self._maybe_train()
+        self._log_step(source, unknown, action, data)
+
+        return action, data
+
+    # ------------------------------------------------------------------
+    # Step helpers
+    # ------------------------------------------------------------------
+
+    def _do_stuck_detection(self, action: GameAction, data: dict, should_explore: bool) -> None:
         current_ad = (action, tuple(sorted((data or {}).items())))
         if not should_explore:
             if current_ad == self._prev_action_data:
@@ -284,21 +334,21 @@ class ObjectCentricAgent:
                 self._planner_stuck_count = 0
         self._prev_action_data = current_ad
 
-        # Log action to ReAct for context
-        changed_count = len([
-            e for e in self.space.objects.values()
-            if e.interestingness > 0
-        ])
+    def _log_action(self, action: GameAction, data: dict) -> None:
+        changed_count = len([e for e in self.space.objects.values() if e.interestingness > 0])
         self.react.log_action(action.name, data or {}, changed_count)
 
-        # Periodic KnowledgeSpace training
-        if self._action_count % 20 == 0:
-            self.knowledge.train()
-
+    def _save_prev(self, blobs, action: GameAction, target_id: Optional[str]) -> None:
         self._prev_blobs = blobs
         self._prev_action = action
         self._prev_target_id = target_id
 
+    def _maybe_train(self) -> None:
+        if self._action_count % 20 == 0:
+            self.knowledge.train()
+            self.rt.train_step(self.memory)
+
+    def _log_step(self, source: str, unknown: list, action: GameAction, data: dict) -> None:
         if self.verbose:
             log.debug(
                 f"Step {self._action_count:3d} [{source}] "
@@ -307,7 +357,49 @@ class ObjectCentricAgent:
                 + (f" {data}" if data else "")
             )
 
-        return action, data
+    def _decode_queued_action(
+        self, raw: dict
+    ) -> Tuple[GameAction, dict, Optional[str]]:
+        """
+        Convert a queued action dict from the LLM to (GameAction, data, target_id).
+
+        LLM action names: CLICK, UP, DOWN, LEFT, RIGHT
+        Actual game actions: is_complex() for click, ACTION1-4 for directions.
+        """
+        from curiosity_explorer import _DIR_ACTIONS  # {up/down/left/right → GameAction}
+
+        act_name = raw.get("action", "").upper()
+
+        click_actions = [a for a in self.action_space if a.is_complex()]
+        dir_map = {
+            "UP": _DIR_ACTIONS.get("up"),
+            "DOWN": _DIR_ACTIONS.get("down"),
+            "LEFT": _DIR_ACTIONS.get("left"),
+            "RIGHT": _DIR_ACTIONS.get("right"),
+        }
+
+        if act_name == "CLICK" and click_actions:
+            game_action = click_actions[0]
+            x = max(0, min(63, int(raw.get("x", 0))))
+            y = max(0, min(63, int(raw.get("y", 0))))
+            data = {"x": x, "y": y}
+            # Find nearest object for target_id tracking
+            target_id = None
+            best_dist = float("inf")
+            for oid, entry in self.space.objects.items():
+                cr, cc = entry.properties.get("centroid", (0, 0))
+                d = ((cr - y) ** 2 + (cc - x) ** 2) ** 0.5
+                if d < best_dist:
+                    best_dist, target_id = d, oid
+            return game_action, data, target_id
+
+        ga = dir_map.get(act_name)
+        if ga is not None and ga in self.action_space:
+            return ga, {}, None
+
+        # Fallback: random non-click action or any action
+        safe = [a for a in self.action_space if not a.is_complex()] or self.action_space
+        return random.choice(safe), {}, None
 
     def on_level_complete(self) -> None:
         """
